@@ -38,11 +38,7 @@ st.set_page_config(page_title="AuroraStays QnA", page_icon=logo_svg(64, "#287A5B
 
 # ---------------------------------------------------------------- state
 ss = st.session_state
-if "theme" not in ss:
-    try:
-        ss.theme = "dark" if (st.context.theme.type == "dark") else "light"
-    except Exception:
-        ss.theme = "light"
+ss.setdefault("theme", "light")  # day mode first; the button in the top bar switches to night
 ss.setdefault("messages", [])
 ss.setdefault("pending", None)
 ss.setdefault("active_id", None)
