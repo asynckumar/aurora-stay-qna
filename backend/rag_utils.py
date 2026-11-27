@@ -62,7 +62,8 @@ CANDIDATES = 20          # candidates taken from each retriever before fusion
 RRF_K = 60               # standard Reciprocal Rank Fusion constant
 FUSION = os.getenv("FUSION", "convex")       # "convex" or "rrf"
 ALPHA = float(os.getenv("FUSION_ALPHA", "0.5"))  # weight of dense score
-EXPAND_ALIASES = os.getenv("EXPAND_ALIASES", "1") == "1"  # city name -> property code (cities only)
+EXPAND_ALIASES = os.getenv("EXPAND_ALIASES", "1") == "1"  # city name -> property code
+PIN_PROPERTY_ROW = os.getenv("PIN_PROPERTY_ROW", "1") == "1"  # a named property's profile row is always offered (cities only)
 REWRITE_QUERIES = os.getenv("REWRITE_QUERIES", "1") == "1"
 CONTEXT_FILTER = os.getenv("CONTEXT_FILTER", "1") == "1"   # LLM keeps only needed passages
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gpt-4o-mini")
@@ -75,8 +76,6 @@ DEDUPE_JACCARD = 0.7     # word overlap above which two chunks are duplicates
 AUTO_THRESHOLD = 0.75    # same routing thresholds as the evaluation notebook
 REVIEW_THRESHOLD = 0.50
 
-INSUFFICIENT = ("The available policy documents do not contain enough "
-                "information to answer this question.")
 
 _STOP = {"the", "a", "an", "and", "or", "of", "to", "is", "are", "be", "in",
          "for", "by", "with", "on", "as", "at", "it", "that", "this", "may",
@@ -128,18 +127,30 @@ class HybridRetriever:
             best = self.richest.get(key)
             if key and (best is None or len(_body(d.page_content)) > len(_body(best))):
                 self.richest[key] = d.page_content
+        # Property code -> the fullest copy of that property's profile row.
+        self.profile_row: dict[str, str] = {}
+        for text in self.richest.values():
+            m = re.search(r"Property: (ASH-[A-Z]{3})\b", text)
+            if m:
+                self.profile_row[m.group(1)] = text
 
-    def _build_aliases(self) -> dict[str, str]:
-        """'Property: ASH-MIA Brickell, Miami FL' -> {'miami': 'ASH-MIA Brickell'}."""
-        aliases: dict[str, str] = {}
+    def _build_aliases(self) -> dict[str, list[str]]:
+        """'Property: ASH-MIA Brickell, Miami FL' -> {'miami': ['ASH-MIA Brickell']}.
+
+        A city maps to a list, so a second property in the same city would be
+        added to the search text as well.
+        """
+        aliases: dict[str, list[str]] = {}
         pat = re.compile(r"Property: (ASH-[A-Z]{3} ([A-Za-z ]+?))(?:, ([A-Za-z ]+?) [A-Z]{2})?[;.]")
         for d in self.docs:
             for m in pat.finditer(d.page_content):
                 # Cities only: area names such as Union, Harbor or Loop are also
                 # ordinary words and would add codes to unrelated questions.
                 name, city = m.group(1), m.group(3)
-                for key in filter(None, [city]):
-                    aliases.setdefault(key.strip().lower(), name)
+                if city:
+                    names = aliases.setdefault(city.strip().lower(), [])
+                    if name not in names:
+                        names.append(name)
         return aliases
 
     @staticmethod
@@ -172,9 +183,9 @@ class HybridRetriever:
         # not the code itself (re-adding a code already present over-weights
         # the property table).
         present = set(re.findall(r"ASH-[A-Z]{3}", query))
-        found = sorted({v for k, v in self.aliases.items()
-                        if v.split()[0] not in present
-                        and re.search(rf"\b{re.escape(k)}\b", query.lower())})
+        found = sorted({name for city, names in self.aliases.items()
+                        if re.search(rf"\b{re.escape(city)}\b", query.lower())
+                        for name in names if name.split()[0] not in present})
         return f"{query} ({', '.join(found)})" if found else query
 
     def _too_long(self, text: str) -> bool:
@@ -252,6 +263,20 @@ class HybridRetriever:
         # Replace each table row with its fullest copy across documents.
         chosen = [self._richest_copy(t) for t in chosen]
         chosen = list(dict.fromkeys(chosen))
+
+        # A question that names a property always gets that property's profile
+        # row, even when the search ranked it low (for example a question about
+        # something the profile does not list). The context filter removes the
+        # row again when the question does not need it.
+        if PIN_PROPERTY_ROW:
+            for code in list(dict.fromkeys(re.findall(r"ASH-[A-Z]{3}", q)))[:2]:
+                row = self.profile_row.get(code)
+                if row is None or row in chosen:
+                    continue
+                if len(chosen) >= k:
+                    chosen[-1] = row  # keep to k passages: the lowest-ranked one makes room
+                else:
+                    chosen.append(row)
         return [(by_text[t], max(0.0, self._cos(t, qv, cos_by_text))) for t in chosen]
 
     def _richest_copy(self, text: str) -> str:
@@ -416,7 +441,7 @@ RULES = """
 9. If sources disagree, state both and say which document each comes from.
 10. Write in neutral third person ("the guest", "staff should"), 2 to 3 short sentences in a single paragraph, no greeting, no filler.
 11. On the very last line write exactly one of: COVERAGE: FULL, COVERAGE: PARTIAL, COVERAGE: NONE (whether the sources fully answer the question).
-""".format(insufficient=INSUFFICIENT)
+"""
 
 
 def build_prompt(query: str, docs) -> str:
@@ -509,12 +534,17 @@ def split_coverage(text: str) -> tuple[str, str]:
 
     Everything from the coverage line on is dropped, so no part of that line
     is ever shown. Without a usable value the coverage is NONE when the
-    answer cites nothing and reads as a refusal, otherwise PARTIAL.
+    answer is a refusal: it says the documents do not have the fact and either
+    cites nothing or opens with that statement, uncited (a refusal may go on
+    to cite a related rule). Otherwise it is PARTIAL.
     """
     start, cov = find_coverage(text)
     answer = (text if start is None else text[:start]).strip()
     if cov is None:
-        refusal = not re.search(r"\[\d+\]", answer) and _REFUSAL.search(answer)
+        cites = re.search(r"\[\d+\]", answer)
+        opening = _SENTENCE.split(answer)[0] if answer else ""
+        opens_refusing = _REFUSAL.search(opening) and not re.search(r"\[\d+\]", opening)
+        refusal = _REFUSAL.search(answer) and (not cites or opens_refusing)
         cov = "NONE" if refusal else "PARTIAL"
     answer = _drop_closing_advice(answer)
     if cov == "FULL":
