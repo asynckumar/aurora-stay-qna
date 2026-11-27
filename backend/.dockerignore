@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+# Secrets must never be copied into the image
+config.json
+.env
+# Files the backend writes while it runs
+feedback.jsonl
+history.db*
+data_out/
