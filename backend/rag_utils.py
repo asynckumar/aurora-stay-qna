@@ -64,6 +64,8 @@ FUSION = os.getenv("FUSION", "convex")       # "convex" or "rrf"
 ALPHA = float(os.getenv("FUSION_ALPHA", "0.5"))  # weight of dense score
 EXPAND_ALIASES = os.getenv("EXPAND_ALIASES", "1") == "1"  # city name -> property code
 PIN_PROPERTY_ROW = os.getenv("PIN_PROPERTY_ROW", "1") == "1"  # a named property's profile row is always offered (cities only)
+SKIP_OTHER_PROPERTIES = os.getenv("SKIP_OTHER_PROPERTIES", "1") == "1"  # a question that names a property gets no other property's profile row
+_PROFILE_ROW = re.compile(r"Property: (ASH-[A-Z]{3})\b")
 REWRITE_QUERIES = os.getenv("REWRITE_QUERIES", "1") == "1"
 CONTEXT_FILTER = os.getenv("CONTEXT_FILTER", "1") == "1"   # LLM keeps only needed passages
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", "gpt-4o-mini")
@@ -130,7 +132,7 @@ class HybridRetriever:
         # Property code -> the fullest copy of that property's profile row.
         self.profile_row: dict[str, str] = {}
         for text in self.richest.values():
-            m = re.search(r"Property: (ASH-[A-Z]{3})\b", text)
+            m = _PROFILE_ROW.search(text)
             if m:
                 self.profile_row[m.group(1)] = text
 
@@ -246,7 +248,13 @@ class HybridRetriever:
         by_text = {d.page_content: d for d in self.docs}
         chosen: list[str] = []
         top_score = fused_by_text[ranked[0]] if ranked else 0.0
+        named = set(re.findall(r"ASH-[A-Z]{3}", q)) if SKIP_OTHER_PROPERTIES else set()
         for text in ranked:
+            # The question names its properties: the profile row of any other
+            # property cannot help and would take the place of a useful passage.
+            other = _PROFILE_ROW.search(text) if named else None
+            if other and other.group(1) not in named:
+                continue
             if len(chosen) >= MIN_K and fused_by_text.get(text, 0.0) < REL_CUTOFF * top_score:
                 break
             dup = self._duplicate_of(text, chosen)
@@ -370,12 +378,15 @@ _FILTER_CACHE = None
 _NUMBER_LIST = re.compile(r"\s*\d+(?:[\s,]+\d+)*[\s,.]*")
 
 
-def filter_context(query: str, scored: list) -> list:
+def filter_context(query: str, scored: list, named: tuple = ()) -> list:
     """Keep only the retrieved passages an LLM judges necessary, best first.
 
     Runs before generation, so the model really sees only these passages.
     Never raises and never returns nothing: on any failure the retrieved list
     is returned unchanged; if the LLM keeps nothing, the two best matches are kept.
+    named holds the property codes the question names. When the LLM keeps
+    nothing, the profile row of a named property takes the first place, so
+    the answer can say what that profile does list.
     Only a reply that is a plain list of numbers is used. A sentence such as
     "None of the 6 passages help" also contains a digit, so any other reply
     returns all passages and is not cached.
@@ -401,7 +412,10 @@ def filter_context(query: str, scored: list) -> list:
     keep = list(dict.fromkeys(n for n in picks if 1 <= n <= len(scored)))
     # Nothing judged useful: pass only the two best matches, so the model sees
     # little noise and can say the documents do not cover the question.
-    out = [scored[n - 1] for n in keep] or scored[:2]
+    out = [scored[n - 1] for n in keep]
+    if not out:
+        rows = [s for s in scored if any(f"Property: {code}" in s[0].page_content for code in named)]
+        out = (rows + [s for s in scored if s not in rows])[:2]
     _FILTER_CACHE.set(key, out)
     return out
 
@@ -416,8 +430,12 @@ def retrieve_with_scores(query: str, k: int = DEFAULT_K, vectorstore=None, reran
     """Top-k (Document, cosine) pairs. With filtered=True (used before
     generation) only the passages needed for the question are kept."""
     search_query = rewrite_query(query) if rewrite else query
-    scored = get_retriever(vectorstore, reranker).search(search_query, k=k, question=query)
-    return filter_context(query, scored) if filtered else scored
+    retriever = get_retriever(vectorstore, reranker)
+    scored = retriever.search(search_query, k=k, question=query)
+    if not filtered:
+        return scored
+    named = tuple(dict.fromkeys(re.findall(r"ASH-[A-Z]{3}", retriever.expand(search_query)))) if PIN_PROPERTY_ROW else ()
+    return filter_context(query, scored, named)
 
 
 def retrieve(query: str, k: int = DEFAULT_K, vectorstore=None) -> list[str]:
